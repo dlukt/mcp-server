@@ -1,4 +1,4 @@
-module github.com/dlukt/mcp-fileserver
+module github.com/dlukt/mcp-server
 
 go 1.24.6
 
