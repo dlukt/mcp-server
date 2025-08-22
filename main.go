@@ -339,7 +339,7 @@ func handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResu
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	maxBytes := req.GetInt("maxBytes", 1<<20) // 1MB default
+	maxBytes := req.GetInt("maxBytes", 1<<30) // 1GB default
 	abs, relClean, err := resolveInsideBase(base, p)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
