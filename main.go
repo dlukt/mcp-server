@@ -101,21 +101,21 @@ func main() {
 		"fs_read",
 		mcp.WithDescription("Read a text file under the base directory."),
 		mcp.WithString("path", mcp.Required(), mcp.Description("Relative path of file to read")),
-		mcp.WithNumber("maxBytes", mcp.Description("Maximum bytes to read; default 1MB")),
+		mcp.WithNumber("maxBytes", mcp.Description("Maximum bytes to read; default unlimited")),
 	)
 	s.AddTool(readTool, handleRead)
 
 	// http_request: perform HTTP(S) requests with arbitrary methods
 	httpTool := mcp.NewTool(
 		"http_request",
-		mcp.WithDescription("Perform an HTTP(S) request and return status, headers, and a truncated body preview. Blocks localhost and private networks by default (set allowPrivate=true to override)."),
+		mcp.WithDescription("Perform an HTTP(S) request and return status, headers, and a (possibly truncated) body preview. Blocks localhost and private networks by default (set allowPrivate=true to override)."),
 		mcp.WithString("method", mcp.Required(), mcp.Description("HTTP method, e.g. GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS")),
 		mcp.WithString("url", mcp.Required(), mcp.Description("Absolute URL (http or https)")),
 		mcp.WithString("headers", mcp.Description("Optional JSON object of request headers, e.g. '{\"Accept\":\"application/json\"}'")),
 		mcp.WithString("body", mcp.Description("Optional request body (sent as-is)")),
 		mcp.WithNumber("timeoutSec", mcp.Description("Request timeout in seconds (default 20)")),
 		mcp.WithBoolean("followRedirects", mcp.Description("Follow redirects (default true)")),
-		mcp.WithNumber("maxBytes", mcp.Description("Max response bytes to return (default 1MB)")),
+		mcp.WithNumber("maxBytes", mcp.Description("Max response bytes to return (default unlimited)")),
 		mcp.WithBoolean("allowPrivate", mcp.Description("Allow requests to localhost/private networks (default false)")),
 	)
 	s.AddTool(httpTool, handleHTTPRequest)
@@ -264,7 +264,7 @@ func handleCreate(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolRe
 			return mcp.NewToolResultError("file exists and overwrite not allowed"), nil
 		}
 	}
-	// size guard
+	// size guard (only if configured > 0)
 	if maxBytes > 0 && int64(len(args.Content)) > maxBytes {
 		return mcp.NewToolResultErrorf("content too large: %d bytes (limit %d)", len(args.Content), maxBytes), nil
 	}
@@ -301,6 +301,7 @@ func handleUpdate(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolRe
 			return mcp.NewToolResultErrorf("mkdirs failed: %v", err), nil
 		}
 	}
+	// size guard (only if configured > 0)
 	if maxBytes > 0 && int64(len(content)) > maxBytes {
 		return mcp.NewToolResultErrorf("content too large: %d bytes (limit %d)", len(content), maxBytes), nil
 	}
@@ -339,7 +340,8 @@ func handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResu
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	maxBytes := req.GetInt("maxBytes", 1<<30) // 1GB default
+	// default unlimited; only truncate if maxBytes > 0
+	maxBytes := req.GetInt("maxBytes", 0)
 	abs, relClean, err := resolveInsideBase(base, p)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
@@ -348,7 +350,7 @@ func handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResu
 	if err != nil {
 		return mcp.NewToolResultErrorf("read failed: %v", err), nil
 	}
-	if len(b) > maxBytes {
+	if maxBytes > 0 && len(b) > maxBytes {
 		b = b[:maxBytes]
 	}
 	payload := struct {
@@ -417,7 +419,8 @@ func handleHTTPRequest(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallT
 
 	body := req.GetString("body", "")
 	timeoutSec := req.GetInt("timeoutSec", 20)
-	maxBytes := req.GetInt("maxBytes", 1<<20) // 1MB default
+	// default unlimited; only apply limit when > 0
+	maxBytes := req.GetInt("maxBytes", 0)
 	follow := req.GetBool("followRedirects", true)
 
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
@@ -442,10 +445,15 @@ func handleHTTPRequest(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallT
 	}
 	defer resp.Body.Close()
 
-	lr := io.LimitReader(resp.Body, int64(maxBytes)+1)
-	b, _ := io.ReadAll(lr)
-	trunc := len(b) > maxBytes
-	if trunc {
+	var reader io.Reader = resp.Body
+	if maxBytes > 0 {
+		reader = io.LimitReader(resp.Body, int64(maxBytes)+1)
+	}
+	b, _ := io.ReadAll(reader)
+
+	trunc := false
+	if maxBytes > 0 && len(b) > maxBytes {
+		trunc = true
 		b = b[:maxBytes]
 	}
 
@@ -538,7 +546,8 @@ func parseFlags() Config {
 	var cfg Config
 	flag.StringVar(&cfg.BaseDir, "base", ".", "Base directory the server will expose")
 	flag.BoolVar(&cfg.AllowOverwrite, "allow-overwrite", false, "Permit fs_create to overwrite existing files when overwrite=true")
-	flag.Int64Var(&cfg.MaxFileBytes, "max-bytes", 5<<20, "Max bytes accepted for create/update (0 = unlimited)")
+	// Default now unlimited (0)
+	flag.Int64Var(&cfg.MaxFileBytes, "max-bytes", 0, "Max bytes accepted for create/update (0 = unlimited)")
 	flag.Parse()
 	return cfg
 }
