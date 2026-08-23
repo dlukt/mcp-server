@@ -278,13 +278,49 @@ for _ in range(6):
 after = mcp_socket_fds(proc.pid)
 check("no idle-socket accumulation (CloseIdleConnections)", after <= before + 1, f"sockets before={before} after={after}")
 
-# proxy env must be ignored
-os.environ["HTTP_PROXY"] = f"http://127.0.0.1:{port}"
-os.environ["http_proxy"] = f"http://127.0.0.1:{port}"
-r = call(proc, "http_request", {"method": "GET", "url": "http://example.com"})
-check("proxy env not honored (direct dial attempted)", True, "")  # informational: no proxy error mention
-for k in ("HTTP_PROXY", "http_proxy"):
-    os.environ.pop(k, None)
+# codex R7 P2: proxy env must be ignored — spawn a dedicated server WITH
+# proxy vars set in its environment (os.environ changes here would not reach
+# the already-running child). A proxy-honoring client would send the request
+# for example.com to our local listener; if that happens (or the proxy is
+# contacted at all), this check fails. example.com resolves to a public IP,
+# so a direct dial must succeed or fail without ever touching the listener.
+proxy_hits = []
+class ProxyProbeH(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    def do_GET(self):
+        proxy_hits.append(self.path)
+        b = b"PROXY-WAS-USED"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+    def log_message(self, *a): pass
+
+psrv = http.server.HTTPServer(("127.0.0.1", 0), ProxyProbeH)
+pport = psrv.server_address[1]
+threading.Thread(target=psrv.serve_forever, daemon=True).start()
+
+env = dict(os.environ)
+env["HTTP_PROXY"] = f"http://127.0.0.1:{pport}"
+env["http_proxy"] = f"http://127.0.0.1:{pport}"
+env["HTTPS_PROXY"] = f"http://127.0.0.1:{pport}"
+env["https_proxy"] = f"http://127.0.0.1:{pport}"
+env["ALL_PROXY"] = f"http://127.0.0.1:{pport}"
+proc2 = subprocess.Popen([BIN, "--base", tempfile.mkdtemp(prefix="mcpsbx2-")],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, env=env)
+proc2.stdin.write(json.dumps({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientInfo":{"name":"t","version":"0"},"capabilities":{}}}).encode()+b"\n"); proc2.stdin.flush()
+proc2.stdout.readline()
+proc2.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n'); proc2.stdin.flush()
+# allowPrivate=true disables the dial guard, so a proxy-honoring client
+# would now actually contact the 127.0.0.1 proxy; an env-ignoring client
+# dials example.com directly and never touches the listener.
+r = call(proc2, "http_request", {"method":"GET","url":"http://example.com/","allowPrivate":True})
+t = get_text(r) or ""
+proxy_used = any("PROXY-WAS-USED" in json.dumps(r) for _ in [0]) or bool(proxy_hits)
+check("proxy env not honored (proxy never contacted)", not proxy_used, f"proxy_hits={proxy_hits} resp={t[:120]}")
+proc2.stdin.close(); proc2.wait(timeout=10)
+psrv.shutdown()
 
 proc.stdin.close()
 proc.wait(timeout=10)
