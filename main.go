@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -230,8 +231,11 @@ func handleList(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResu
 	out := []string{}
 	truncated := false
 
-	// listDir appends entries of dirRel (sorted, as returned by ReadDir).
-	// Symlinks are listed but never descended into.
+	// listDir appends entries of dirRel. Entries are sorted by name so
+	// output is deterministic across filesystems. Symlinks are listed but
+	// never descended into. Once maxEntries is reached, the walk keeps
+	// probing (without appending) for one more matching entry so the
+	// truncated flag is only set when results are actually incomplete.
 	var listDir func(dirRel string) error
 	listDir = func(dirRel string) error {
 		f, err := a.root.Open(dirRel)
@@ -243,6 +247,7 @@ func handleList(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResu
 		if err != nil {
 			return err
 		}
+		sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
 		for _, e := range entries {
 			name := e.Name()
 			childRel := name
@@ -250,16 +255,29 @@ func handleList(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResu
 				childRel = dirRel + "/" + name
 			}
 			isDir := e.IsDir()
-			if pattern == "" {
-				out = append(out, childRel+dirSuffix(isDir))
-			} else if match, merr := filepath.Match(pattern, name); merr != nil {
-				return merr
-			} else if match {
-				out = append(out, childRel+dirSuffix(isDir))
+			match := pattern == ""
+			if pattern != "" {
+				m, merr := filepath.Match(pattern, name)
+				if merr != nil {
+					return merr
+				}
+				match = m
 			}
 			if maxEntries > 0 && len(out) >= maxEntries {
-				truncated = true
-				return errStopWalk
+				// Limit reached: probe for any further matching entry.
+				if match {
+					truncated = true
+					return errStopWalk
+				}
+				if isDir && recursive {
+					if err := listDir(childRel); err != nil {
+						return err
+					}
+				}
+				continue
+			}
+			if match {
+				out = append(out, childRel+dirSuffix(isDir))
 			}
 			if isDir && recursive {
 				if err := listDir(childRel); err != nil {

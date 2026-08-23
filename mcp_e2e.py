@@ -245,6 +245,20 @@ check("rename with makedirs works", not is_err(r), get_text(r))
 r = call(proc, "fs_read", {"path": "sub2/moved.txt"})
 check("moved file readable", get_json(r)["preview"] == "SRC", get_text(r))
 
+# codex R6 P2: maxEntries boundary must not cry truncated at the exact boundary
+for p in ("m01.txt", "m02.txt", "m03.txt"):
+    r = call(proc, "fs_create", {"path": p, "content": "m"})
+    assert not is_err(r), get_text(r)
+r = call(proc, "fs_list", {"path": ".", "pattern": "m0*.txt", "maxEntries": 3})
+j = get_json(r)
+check("maxEntries exact boundary not truncated", j["truncated"] is False and j["count"] == 3, get_text(r))
+r = call(proc, "fs_list", {"path": ".", "pattern": "m0*.txt", "maxEntries": 2})
+j = get_json(r)
+check("maxEntries below boundary truncated", j["truncated"] is True and j["count"] == 2, get_text(r))
+r = call(proc, "fs_list", {"path": ".", "pattern": "m0*.txt", "maxEntries": 2, "recursive": True})
+j = get_json(r)
+check("sorted listing order", j["paths"] == sorted(j["paths"]), str(j["paths"]))
+
 # codex P1: per-request transports must not accumulate idle keepalive sockets
 def mcp_socket_fds(pid):
     import glob as _g

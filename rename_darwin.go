@@ -31,13 +31,19 @@ func (a *app) renameNoReplace(fromRel, toRel string) error {
 	}
 	defer toDir.Close()
 
-	fromBuf := []byte(fromBase) // cleanRelPath guarantees no NUL bytes
-	toBuf := []byte(toBase)
+	fromPtr, err := unix.BytePtrFromString(fromBase) // cleanRelPath rejects NUL bytes
+	if err != nil {
+		return err
+	}
+	toPtr, err := unix.BytePtrFromString(toBase)
+	if err != nil {
+		return err
+	}
 
 	n, _, errno := unix.Syscall6(
 		unix.SYS_RENAMEATX_NP,
-		fromDir.Fd(), uintptr(unsafe.Pointer(&fromBuf[0])),
-		toDir.Fd(), uintptr(unsafe.Pointer(&toBuf[0])),
+		fromDir.Fd(), uintptr(unsafe.Pointer(fromPtr)),
+		toDir.Fd(), uintptr(unsafe.Pointer(toPtr)),
 		unix.RENAME_EXCL, 0,
 	)
 	_ = n
