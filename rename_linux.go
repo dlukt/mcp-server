@@ -41,10 +41,9 @@ func (a *app) renameNoReplace(fromRel, toRel string) error {
 		return nil
 	case errors.Is(err, syscall.ENOSYS), errors.Is(err, syscall.EINVAL):
 		// Kernel < 3.15 or filesystem without RENAME_NOREPLACE support.
-		// Fall back to plain rename inside the same root: the pre-check
-		// Lstat makes the common case correct; the residual race window
-		// only exists on these old systems.
-		return a.root.Rename(fromRel, toRel)
+		// Refuse rather than fall back to a clobbering rename: the tool's
+		// no-replace guarantee must not silently degrade.
+		return fmt.Errorf("atomic no-replace rename not supported by this kernel/filesystem: %w", errors.Join(err, errors.ErrUnsupported))
 	case errors.Is(err, fs.ErrNotExist):
 		// Destination parent vanished between MkdirAll and renameat2 —
 		// surface as a plain not-exist error.

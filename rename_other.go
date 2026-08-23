@@ -26,5 +26,13 @@ func (a *app) renameNoReplace(fromRel, toRel string) error {
 	if err := a.root.Link(fromRel, toRel); err != nil {
 		return err // fs.ErrExist when destination exists
 	}
-	return a.root.Remove(fromRel)
+	if err := a.root.Remove(fromRel); err != nil {
+		// Roll the link back so a reported failure never leaves a
+		// duplicate destination behind (e.g. unwritable source parent).
+		if rerr := a.root.Remove(toRel); rerr != nil {
+			return fmt.Errorf("remove source: %v (rolling back destination also failed: %v)", err, rerr)
+		}
+		return fmt.Errorf("remove source after link (destination rolled back): %w", err)
+	}
+	return nil
 }
