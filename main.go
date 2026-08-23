@@ -1,3 +1,10 @@
+// mcp-fileserver: a sandboxed MCP server exposing file CRUD (and HTTP fetch)
+// inside a single base directory tree.
+//
+// Containment is enforced by os.Root (Linux openat2 RESOLVE_BENEATH), so
+// symlinks cannot escape the base directory, and by a dial-time IP guard for
+// the http_request tool, so redirects and DNS rebinding cannot reach private
+// networks.
 package main
 
 import (
@@ -14,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -21,17 +29,31 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
-// Config holds runtime configuration for the server
+const serverVersion = "0.4.0"
+
+// Config holds runtime configuration for the server.
 type Config struct {
 	BaseDir        string
 	AllowOverwrite bool
 	MaxFileBytes   int64
 }
 
+// app carries the sandbox root and config into tool handlers via context.
+type app struct {
+	root *os.Root
+	base string
+	cfg  Config
+}
+
+type ctxKeyApp struct{}
+
+func appFrom(ctx context.Context) *app {
+	return ctx.Value(ctxKeyApp{}).(*app)
+}
+
 func main() {
 	cfg := parseFlags()
 
-	// Resolve and validate base directory
 	baseAbs, err := filepath.Abs(cfg.BaseDir)
 	checkFatal(err)
 	info, err := os.Stat(baseAbs)
@@ -42,43 +64,70 @@ func main() {
 		checkFatal(fmt.Errorf("base path is not a directory: %s", baseAbs))
 	}
 
+	// Kernel-enforced sandbox: every FS operation below goes through root.
+	root, err := os.OpenRoot(baseAbs)
+	checkFatal(err)
+	defer root.Close()
+
+	a := &app{root: root, base: baseAbs, cfg: cfg}
+
 	s := server.NewMCPServer(
 		"mcp-fileserver",
-		"0.3.0",
+		serverVersion,
 		server.WithToolCapabilities(false),
 		server.WithRecovery(),
 	)
 
 	// ===== Tools =====
 
-	// list_files
+	// fs_list
 	listTool := mcp.NewTool(
 		"fs_list",
-		mcp.WithDescription("List files and directories under the configured base directory. Returns relative paths."),
+		mcp.WithDescription("List files and directories under the configured base directory. Returns relative paths; directories end with '/'."),
 		mcp.WithString("path",
 			mcp.Description("Relative subpath to list from (default '.')"),
 		),
 		mcp.WithBoolean("recursive",
-			mcp.Description("Recurse into subdirectories (default false)"),
+			mcp.Description("Recurse into subdirectories (default false). Does not descend through symlinks."),
 		),
 		mcp.WithString("pattern",
-			mcp.Description("Optional glob (e.g. '*.go') applied to file name (not directory)"),
+			mcp.Description("Optional glob (e.g. '*.go') matched against the entry name; applies to files and directories"),
+		),
+		mcp.WithNumber("maxEntries",
+			mcp.Description("Stop listing after this many entries (default 0 = unlimited)"),
 		),
 	)
 	s.AddTool(listTool, handleList)
 
-	// create_file
+	// fs_read
+	readTool := mcp.NewTool(
+		"fs_read",
+		mcp.WithDescription("Read a text file under the base directory."),
+		mcp.WithString("path", mcp.Required(), mcp.Description("Relative path of file to read")),
+		mcp.WithNumber("maxBytes", mcp.Description("Maximum bytes to read; default unlimited")),
+	)
+	s.AddTool(readTool, handleRead)
+
+	// fs_stat
+	statTool := mcp.NewTool(
+		"fs_stat",
+		mcp.WithDescription("Stat a file or directory under the base directory (size, mode, mtime, symlink target)."),
+		mcp.WithString("path", mcp.Required(), mcp.Description("Relative path to stat")),
+	)
+	s.AddTool(statTool, handleStat)
+
+	// fs_create
 	createTool := mcp.NewTool(
 		"fs_create",
 		mcp.WithDescription("Create a new file with given content under the base directory."),
 		mcp.WithString("path", mcp.Required(), mcp.Description("Relative path of the file to create")),
 		mcp.WithString("content", mcp.Description("File contents as UTF-8 text")),
-		mcp.WithBoolean("overwrite", mcp.Description("Allow overwriting if file exists (default false; server may also forbid)")),
+		mcp.WithBoolean("overwrite", mcp.Description("Allow overwriting if file exists (default false; server must also be started with --allow-overwrite)")),
 		mcp.WithBoolean("makedirs", mcp.Description("Create parent directories as needed (default true)")),
 	)
 	s.AddTool(createTool, handleCreate)
 
-	// update_file (write/replace full content)
+	// fs_update
 	updateTool := mcp.NewTool(
 		"fs_update",
 		mcp.WithDescription("Replace the contents of an existing file under the base directory."),
@@ -88,44 +137,52 @@ func main() {
 	)
 	s.AddTool(updateTool, handleUpdate)
 
-	// delete_file
+	// fs_delete
 	deleteTool := mcp.NewTool(
 		"fs_delete",
-		mcp.WithDescription("Delete a file under the base directory. Fails on directories."),
-		mcp.WithString("path", mcp.Required(), mcp.Description("Relative path of file to delete")),
+		mcp.WithDescription("Delete a file (or symlink: the link itself) under the base directory. Directories require recursive=true."),
+		mcp.WithString("path", mcp.Required(), mcp.Description("Relative path to delete")),
+		mcp.WithBoolean("recursive", mcp.Description("Allow deleting a directory and all its contents (default false)")),
 	)
 	s.AddTool(deleteTool, handleDelete)
 
-	// read_file
-	readTool := mcp.NewTool(
-		"fs_read",
-		mcp.WithDescription("Read a text file under the base directory."),
-		mcp.WithString("path", mcp.Required(), mcp.Description("Relative path of file to read")),
-		mcp.WithNumber("maxBytes", mcp.Description("Maximum bytes to read; default unlimited")),
+	// fs_mkdir
+	mkdirTool := mcp.NewTool(
+		"fs_mkdir",
+		mcp.WithDescription("Create a directory under the base directory."),
+		mcp.WithString("path", mcp.Required(), mcp.Description("Relative path of the directory to create")),
+		mcp.WithBoolean("parents", mcp.Description("Create missing parent directories (default true). With parents=true an existing directory is not an error.")),
 	)
-	s.AddTool(readTool, handleRead)
+	s.AddTool(mkdirTool, handleMkdir)
 
-	// http_request: perform HTTP(S) requests with arbitrary methods
+	// fs_rename
+	renameTool := mcp.NewTool(
+		"fs_rename",
+		mcp.WithDescription("Rename/move a file or directory under the base directory. Fails if the destination exists."),
+		mcp.WithString("from", mcp.Required(), mcp.Description("Relative path of the source")),
+		mcp.WithString("to", mcp.Required(), mcp.Description("Relative path of the destination")),
+		mcp.WithBoolean("makedirs", mcp.Description("Create missing parent directories of the destination (default true)")),
+	)
+	s.AddTool(renameTool, handleRename)
+
+	// http_request
 	httpTool := mcp.NewTool(
 		"http_request",
-		mcp.WithDescription("Perform an HTTP(S) request and return status, headers, and a (possibly truncated) body preview. Blocks localhost and private networks by default (set allowPrivate=true to override)."),
+		mcp.WithDescription("Perform an HTTP(S) request and return status, headers, and a (possibly truncated) body preview. Connections to localhost/private networks are blocked at dial time (covering redirects and DNS rebinding); set allowPrivate=true to override. Env proxies are ignored."),
 		mcp.WithString("method", mcp.Required(), mcp.Description("HTTP method, e.g. GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS")),
 		mcp.WithString("url", mcp.Required(), mcp.Description("Absolute URL (http or https)")),
-		mcp.WithString("headers", mcp.Description("Optional JSON object of request headers, e.g. '{\"Accept\":\"application/json\"}'")),
+		mcp.WithString("headers", mcp.Description(`Optional JSON object of request headers, e.g. '{"Accept":"application/json"}'`)),
 		mcp.WithString("body", mcp.Description("Optional request body (sent as-is)")),
 		mcp.WithNumber("timeoutSec", mcp.Description("Request timeout in seconds (default 20)")),
-		mcp.WithBoolean("followRedirects", mcp.Description("Follow redirects (default true)")),
-		mcp.WithNumber("maxBytes", mcp.Description("Max response bytes to return (default unlimited)")),
-		mcp.WithBoolean("allowPrivate", mcp.Description("Allow requests to localhost/private networks (default false)")),
+		mcp.WithBoolean("followRedirects", mcp.Description("Follow redirects (default true, max 10 hops)")),
+		mcp.WithNumber("maxBytes", mcp.Description("Max response bytes to return (default unlimited). Large bodies will blow up the caller's context — set a limit.")),
+		mcp.WithBoolean("allowPrivate", mcp.Description("Allow connections to localhost/private networks (default false)")),
 	)
 	s.AddTool(httpTool, handleHTTPRequest)
 
-	// Serve over stdio and inject runtime config into the context
+	// Serve over stdio and inject the app into the request context.
 	if err := server.ServeStdio(s, server.WithStdioContextFunc(func(ctx context.Context) context.Context {
-		ctx = context.WithValue(ctx, "baseDir", baseAbs)
-		ctx = context.WithValue(ctx, "allowOverwrite", cfg.AllowOverwrite)
-		ctx = context.WithValue(ctx, "maxFileBytes", cfg.MaxFileBytes)
-		return ctx
+		return context.WithValue(ctx, ctxKeyApp{}, a)
 	})); err != nil {
 		fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
 		os.Exit(1)
@@ -135,88 +192,208 @@ func main() {
 // ---------- Tool handlers ----------
 
 type listResult struct {
-	Base   string   `json:"base"`
-	Root   string   `json:"root"`
-	Paths  []string `json:"paths"`
-	Count  int      `json:"count"`
-	TookMs int64    `json:"tookMs"`
+	Base      string   `json:"base"`
+	Root      string   `json:"root"`
+	Paths     []string `json:"paths"`
+	Count     int      `json:"count"`
+	Truncated bool     `json:"truncated"`
+	TookMs    int64    `json:"tookMs"`
 }
 
-func handleList(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	base := ctx.Value("baseDir").(string)
-	start := time.Now()
-	rel := strings.TrimSpace(req.GetString("path", "."))
-	recursive := req.GetBool("recursive", false)
-	pattern := strings.TrimSpace(req.GetString("pattern", ""))
+var errStopWalk = errors.New("max entries reached")
 
-	rootAbs, relClean, err := resolveInsideBase(base, rel)
+func handleList(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	a := appFrom(ctx)
+	start := time.Now()
+	rel, err := cleanRelPath(req.GetString("path", "."))
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	recursive := req.GetBool("recursive", false)
+	pattern := strings.TrimSpace(req.GetString("pattern", ""))
+	maxEntries := req.GetInt("maxEntries", 0)
 
-	var out []string
-	walkFn := func(path string, d fs.DirEntry, err error) error {
-		if err != nil { // propagate filesystem error
+	if pattern != "" {
+		if _, perr := filepath.Match(pattern, "probe"); perr != nil {
+			return mcp.NewToolResultErrorf("invalid pattern: %v", perr), nil
+		}
+	}
+
+	st, err := a.root.Stat(rel)
+	if err != nil {
+		return mcp.NewToolResultErrorf("list failed: %v", err), nil
+	}
+	if !st.IsDir() {
+		return mcp.NewToolResultErrorf("not a directory: %s", rel), nil
+	}
+
+	out := []string{}
+	truncated := false
+
+	// listDir appends entries of dirRel (sorted, as returned by ReadDir).
+	// Symlinks are listed but never descended into.
+	var listDir func(dirRel string) error
+	listDir = func(dirRel string) error {
+		f, err := a.root.Open(dirRel)
+		if err != nil {
 			return err
 		}
-		if path == rootAbs {
-			return nil
+		entries, err := f.ReadDir(-1)
+		f.Close()
+		if err != nil {
+			return err
 		}
-		relPath, _ := filepath.Rel(base, path)
-		name := d.Name()
-		if pattern != "" {
-			match, err := filepath.Match(pattern, name)
-			if err != nil {
-				return err
+		for _, e := range entries {
+			name := e.Name()
+			childRel := name
+			if dirRel != "." {
+				childRel = dirRel + "/" + name
 			}
-			if !match {
-				if d.IsDir() && !recursive {
-					return filepath.SkipDir
+			isDir := e.IsDir()
+			if pattern == "" {
+				out = append(out, childRel+dirSuffix(isDir))
+			} else if match, merr := filepath.Match(pattern, name); merr != nil {
+				return merr
+			} else if match {
+				out = append(out, childRel+dirSuffix(isDir))
+			}
+			if maxEntries > 0 && len(out) >= maxEntries {
+				truncated = true
+				return errStopWalk
+			}
+			if isDir && recursive {
+				if err := listDir(childRel); err != nil {
+					return err
 				}
-				return nil
 			}
 		}
-		if d.IsDir() && !recursive {
-			return filepath.SkipDir
-		}
-		out = append(out, filepath.ToSlash(relPath))
 		return nil
 	}
 
-	if recursive {
-		err = filepath.WalkDir(rootAbs, walkFn)
-	} else {
-		entries, e := os.ReadDir(rootAbs)
-		if e != nil {
-			err = e
-		} else {
-			for _, d := range entries {
-				name := d.Name()
-				if pattern != "" {
-					if m, e := filepath.Match(pattern, name); e != nil || !m {
-						if e != nil {
-							err = e
-						}
-						continue
-					}
-				}
-				relPath := filepath.ToSlash(filepath.Join(relClean, name))
-				out = append(out, relPath)
-			}
-		}
-	}
-	if err != nil {
+	if err := listDir(rel); err != nil && !errors.Is(err, errStopWalk) {
 		return mcp.NewToolResultErrorf("list failed: %v", err), nil
 	}
 
 	res := listResult{
-		Base:   base,
-		Root:   filepath.ToSlash(relClean),
-		Paths:  out,
-		Count:  len(out),
-		TookMs: time.Since(start).Milliseconds(),
+		Base:      a.base,
+		Root:      rel,
+		Paths:     out,
+		Count:     len(out),
+		Truncated: truncated,
+		TookMs:    time.Since(start).Milliseconds(),
 	}
-	return mcp.NewToolResultStructured(res, fmt.Sprintf("%d items under %s", res.Count, res.Root)), nil
+	msg := fmt.Sprintf("%d items under %s", res.Count, res.Root)
+	if truncated {
+		msg += " (truncated at maxEntries)"
+	}
+	return mcp.NewToolResultStructured(res, msg), nil
+}
+
+func dirSuffix(isDir bool) string {
+	if isDir {
+		return "/"
+	}
+	return ""
+}
+
+func handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	a := appFrom(ctx)
+	p, err := req.RequireString("path")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	maxBytes := req.GetInt("maxBytes", 0)
+	rel, err := cleanRelPath(p)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	b, err := a.root.ReadFile(rel)
+	if err != nil {
+		return mcp.NewToolResultErrorf("read failed: %v", err), nil
+	}
+	if maxBytes > 0 && len(b) > maxBytes {
+		b = b[:maxBytes]
+	}
+	preview := string(b)
+	if !utf8.ValidString(preview) {
+		preview = strings.ToValidUTF8(preview, "\uFFFD")
+	}
+	payload := struct {
+		Path    string `json:"path"`
+		Bytes   int    `json:"bytes"`
+		Preview string `json:"preview"`
+	}{
+		Path:    rel,
+		Bytes:   len(b),
+		Preview: preview,
+	}
+	return mcp.NewToolResultStructured(payload, fmt.Sprintf("read %d bytes from %s", len(b), rel)), nil
+}
+
+func handleStat(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	a := appFrom(ctx)
+	p, err := req.RequireString("path")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	rel, err := cleanRelPath(p)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	lst, err := a.root.Lstat(rel)
+	if err != nil {
+		return mcp.NewToolResultErrorf("stat failed: %v", err), nil
+	}
+	isSymlink := lst.Mode()&fs.ModeSymlink != 0
+	// Follow the symlink for target info, but tolerate links that dangle or
+	// point outside the root: reporting the link itself is safe and useful.
+	st := lst
+	broken := false
+	if isSymlink {
+		if s2, err2 := a.root.Stat(rel); err2 == nil {
+			st = s2
+		} else {
+			broken = true
+		}
+	}
+	var target string
+	if isSymlink {
+		if t, terr := a.root.Readlink(rel); terr == nil {
+			target = t
+		}
+	}
+	payload := struct {
+		Path          string `json:"path"`
+		Size          int64  `json:"size"`
+		Mode          string `json:"mode"`
+		IsDir         bool   `json:"isDir"`
+		IsSymlink     bool   `json:"isSymlink"`
+		SymlinkTarget string `json:"symlinkTarget,omitempty"`
+		Broken        bool   `json:"broken,omitempty"`
+		ModTime       string `json:"modTime"`
+	}{
+		Path:      rel,
+		Size:      st.Size(),
+		Mode:      st.Mode().String(),
+		IsDir:     st.IsDir(),
+		IsSymlink: isSymlink,
+		Broken:    broken,
+		ModTime:   st.ModTime().UTC().Format(time.RFC3339),
+	}
+	if target != "" {
+		payload.SymlinkTarget = target
+	}
+	kind := "file"
+	if payload.IsDir {
+		kind = "dir"
+	}
+	if isSymlink {
+		kind = "symlink"
+	}
+	if broken {
+		kind += " (unresolvable)"
+	}
+	return mcp.NewToolResultStructured(payload, fmt.Sprintf("%s %s (%s)", rel, kind, payload.Mode)), nil
 }
 
 type createArgs struct {
@@ -233,9 +410,7 @@ type fileResult struct {
 }
 
 func handleCreate(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	base := ctx.Value("baseDir").(string)
-	allowOverwrite := ctx.Value("allowOverwrite").(bool)
-	maxBytes := ctx.Value("maxFileBytes").(int64)
+	a := appFrom(ctx)
 
 	var args createArgs
 	if err := req.BindArguments(&args); err != nil {
@@ -244,40 +419,56 @@ func handleCreate(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolRe
 	if args.Path == "" {
 		return mcp.NewToolResultError("'path' is required"), nil
 	}
-	if args.Makedirs == nil {
-		b := true
-		args.Makedirs = &b
-	}
-	abs, relClean, err := resolveInsideBase(base, args.Path)
+	makedirs := args.Makedirs == nil || *args.Makedirs
+	overwrite := args.Overwrite != nil && *args.Overwrite
+
+	rel, err := cleanRelPath(args.Path)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	if *args.Makedirs {
-		if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+	if rel == "." {
+		return mcp.NewToolResultError("path must name a file, not the base directory"), nil
+	}
+	if err := a.checkSize(len(args.Content)); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	if makedirs {
+		if err := a.root.MkdirAll(filepath.Dir(rel), 0o755); err != nil {
 			return mcp.NewToolResultErrorf("mkdirs failed: %v", err), nil
 		}
 	}
 
-	if _, err := os.Stat(abs); err == nil {
-		overwrite := args.Overwrite != nil && *args.Overwrite && allowOverwrite
-		if !overwrite {
-			return mcp.NewToolResultError("file exists and overwrite not allowed"), nil
+	action := "created"
+	flagSet := os.O_WRONLY | os.O_CREATE
+	if overwrite {
+		if !a.cfg.AllowOverwrite {
+			return mcp.NewToolResultError("overwrite requested but server was started with --allow-overwrite=false"), nil
 		}
+		flagSet |= os.O_TRUNC
+		action = "overwritten"
+	} else {
+		flagSet |= os.O_EXCL
 	}
-	// size guard (only if configured > 0)
-	if maxBytes > 0 && int64(len(args.Content)) > maxBytes {
-		return mcp.NewToolResultErrorf("content too large: %d bytes (limit %d)", len(args.Content), maxBytes), nil
+
+	f, err := a.root.OpenFile(rel, flagSet, 0o644)
+	if err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			return mcp.NewToolResultError("file exists; pass overwrite=true (server must allow it)"), nil
+		}
+		return mcp.NewToolResultErrorf("create failed: %v", err), nil
 	}
-	if err := os.WriteFile(abs, []byte(args.Content), 0o644); err != nil {
+	if _, err := f.WriteString(args.Content); err != nil {
+		f.Close()
 		return mcp.NewToolResultErrorf("write failed: %v", err), nil
 	}
-	return mcp.NewToolResultStructured(fileResult{Path: filepath.ToSlash(relClean), Action: "created", Bytes: len(args.Content)}, "created"), nil
+	if err := f.Close(); err != nil {
+		return mcp.NewToolResultErrorf("close failed: %v", err), nil
+	}
+	return mcp.NewToolResultStructured(fileResult{Path: rel, Action: action, Bytes: len(args.Content)}, action), nil
 }
 
 func handleUpdate(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	base := ctx.Value("baseDir").(string)
-	maxBytes := ctx.Value("maxFileBytes").(int64)
-
+	a := appFrom(ctx)
 	path, err := req.RequireString("path")
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
@@ -288,81 +479,148 @@ func handleUpdate(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolRe
 	}
 	create := req.GetBool("create", false)
 
-	abs, relClean, err := resolveInsideBase(base, path)
+	rel, err := cleanRelPath(path)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
+	if rel == "." {
+		return mcp.NewToolResultError("path must name a file, not the base directory"), nil
+	}
+	if err := a.checkSize(len(content)); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
 
-	if _, statErr := os.Stat(abs); errors.Is(statErr, os.ErrNotExist) {
-		if !create {
-			return mcp.NewToolResultError("file does not exist; pass create=true to create it"), nil
-		}
-		if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+	flagSet := os.O_WRONLY | os.O_TRUNC
+	if create {
+		flagSet |= os.O_CREATE
+		if err := a.root.MkdirAll(filepath.Dir(rel), 0o755); err != nil {
 			return mcp.NewToolResultErrorf("mkdirs failed: %v", err), nil
 		}
 	}
-	// size guard (only if configured > 0)
-	if maxBytes > 0 && int64(len(content)) > maxBytes {
-		return mcp.NewToolResultErrorf("content too large: %d bytes (limit %d)", len(content), maxBytes), nil
+
+	f, err := a.root.OpenFile(rel, flagSet, 0o644)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) && !create {
+			return mcp.NewToolResultError("file does not exist; pass create=true to create it"), nil
+		}
+		return mcp.NewToolResultErrorf("update failed: %v", err), nil
 	}
-	if err := os.WriteFile(abs, []byte(content), 0o644); err != nil {
+	if _, err := f.WriteString(content); err != nil {
+		f.Close()
 		return mcp.NewToolResultErrorf("write failed: %v", err), nil
 	}
-	return mcp.NewToolResultStructured(fileResult{Path: filepath.ToSlash(relClean), Action: "updated", Bytes: len(content)}, "updated"), nil
+	if err := f.Close(); err != nil {
+		return mcp.NewToolResultErrorf("close failed: %v", err), nil
+	}
+	return mcp.NewToolResultStructured(fileResult{Path: rel, Action: "updated", Bytes: len(content)}, "updated"), nil
 }
 
 func handleDelete(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	base := ctx.Value("baseDir").(string)
+	a := appFrom(ctx)
 	p, err := req.RequireString("path")
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	abs, relClean, err := resolveInsideBase(base, p)
+	recursive := req.GetBool("recursive", false)
+
+	rel, err := cleanRelPath(p)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	st, err := os.Stat(abs)
+	if rel == "." {
+		return mcp.NewToolResultError("refusing to delete the base directory"), nil
+	}
+
+	st, err := a.root.Lstat(rel) // lstat: symlinks are deleted as links
 	if err != nil {
-		return mcp.NewToolResultErrorf("stat failed: %v", err), nil
-	}
-	if st.IsDir() {
-		return mcp.NewToolResultError("refusing to delete a directory"), nil
-	}
-	if err := os.Remove(abs); err != nil {
 		return mcp.NewToolResultErrorf("delete failed: %v", err), nil
 	}
-	return mcp.NewToolResultStructured(fileResult{Path: filepath.ToSlash(relClean), Action: "deleted", Bytes: 0}, "deleted"), nil
+	if st.IsDir() {
+		if !recursive {
+			return mcp.NewToolResultError("refusing to delete a directory; pass recursive=true"), nil
+		}
+		if err := a.root.RemoveAll(rel); err != nil {
+			return mcp.NewToolResultErrorf("delete failed: %v", err), nil
+		}
+	} else if err := a.root.Remove(rel); err != nil {
+		return mcp.NewToolResultErrorf("delete failed: %v", err), nil
+	}
+	return mcp.NewToolResultStructured(fileResult{Path: rel, Action: "deleted"}, "deleted"), nil
 }
 
-func handleRead(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	base := ctx.Value("baseDir").(string)
+func handleMkdir(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	a := appFrom(ctx)
 	p, err := req.RequireString("path")
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	// default unlimited; only truncate if maxBytes > 0
-	maxBytes := req.GetInt("maxBytes", 0)
-	abs, relClean, err := resolveInsideBase(base, p)
+	parents := req.GetBool("parents", true)
+
+	rel, err := cleanRelPath(p)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
-	b, err := os.ReadFile(abs)
+	if rel == "." {
+		return mcp.NewToolResultError("directory already exists: ."), nil
+	}
+
+	if parents {
+		if err := a.root.MkdirAll(rel, 0o755); err != nil {
+			return mcp.NewToolResultErrorf("mkdir failed: %v", err), nil
+		}
+	} else if err := a.root.Mkdir(rel, 0o755); err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			return mcp.NewToolResultError("directory already exists; use parents=true to tolerate"), nil
+		}
+		return mcp.NewToolResultErrorf("mkdir failed: %v", err), nil
+	}
+	return mcp.NewToolResultStructured(fileResult{Path: rel, Action: "created"}, fmt.Sprintf("created directory %s", rel)), nil
+}
+
+func handleRename(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	a := appFrom(ctx)
+	from, err := req.RequireString("from")
 	if err != nil {
-		return mcp.NewToolResultErrorf("read failed: %v", err), nil
+		return mcp.NewToolResultError(err.Error()), nil
 	}
-	if maxBytes > 0 && len(b) > maxBytes {
-		b = b[:maxBytes]
+	to, err := req.RequireString("to")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
 	}
-	payload := struct {
-		Path    string `json:"path"`
-		Bytes   int    `json:"bytes"`
-		Preview string `json:"preview"`
-	}{
-		Path:    filepath.ToSlash(relClean),
-		Bytes:   len(b),
-		Preview: string(b),
+	makedirs := req.GetBool("makedirs", true)
+
+	fromRel, err := cleanRelPath(from)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
 	}
-	return mcp.NewToolResultStructured(payload, fmt.Sprintf("read %d bytes from %s", len(b), payload.Path)), nil
+	toRel, err := cleanRelPath(to)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	if fromRel == "." || toRel == "." {
+		return mcp.NewToolResultError("cannot rename the base directory"), nil
+	}
+	if _, err := a.root.Lstat(fromRel); err != nil {
+		return mcp.NewToolResultErrorf("rename failed: source not found: %v", err), nil
+	}
+	if _, err := a.root.Lstat(toRel); err == nil {
+		return mcp.NewToolResultError("destination exists; delete it first"), nil
+	}
+	if makedirs {
+		if err := a.root.MkdirAll(filepath.Dir(toRel), 0o755); err != nil {
+			return mcp.NewToolResultErrorf("mkdirs failed: %v", err), nil
+		}
+	}
+	if err := a.root.Rename(fromRel, toRel); err != nil {
+		return mcp.NewToolResultErrorf("rename failed: %v", err), nil
+	}
+	return mcp.NewToolResultStructured(
+		struct {
+			From string `json:"from"`
+			To   string `json:"to"`
+		}{From: fromRel, To: toRel},
+		fmt.Sprintf("renamed %s -> %s", fromRel, toRel),
+	), nil
 }
 
 // ---------- HTTP tool handler ----------
@@ -401,13 +659,33 @@ func handleHTTPRequest(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallT
 	}
 
 	allowPrivate := req.GetBool("allowPrivate", false)
-	if !allowPrivate {
-		if private, perr := hostIsPrivate(u.Hostname()); perr != nil {
-			return mcp.NewToolResultErrorf("host resolution failed: %v", perr), nil
-		} else if private {
-			return mcp.NewToolResultError("request blocked to private/localhost address; set allowPrivate=true to override"), nil
-		}
+
+	// Dial-time guard: validated for every TCP connection the client makes,
+	// which covers redirects and defeats DNS rebinding between check and dial.
+	dialer := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Control: func(network, address string, _ syscall.RawConn) error {
+			if allowPrivate {
+				return nil
+			}
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				return fmt.Errorf("invalid dial address %q: %w", address, err)
+			}
+			ip := net.ParseIP(host)
+			if ip == nil {
+				return fmt.Errorf("non-IP dial address %q", address)
+			}
+			if isPrivateIP(ip) {
+				return fmt.Errorf("connection to private/localhost address %s blocked (allowPrivate=true to override)", ip)
+			}
+			return nil
+		},
 	}
+	// Never use env proxies: a proxy would fetch on our behalf and bypass
+	// the dial-time guard entirely.
+	transport := &http.Transport{DialContext: dialer.DialContext}
 
 	headersJSON := strings.TrimSpace(req.GetString("headers", ""))
 	headers := map[string]string{}
@@ -419,22 +697,33 @@ func handleHTTPRequest(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallT
 
 	body := req.GetString("body", "")
 	timeoutSec := req.GetInt("timeoutSec", 20)
-	// default unlimited; only apply limit when > 0
+	if timeoutSec <= 0 {
+		timeoutSec = 20
+	}
 	maxBytes := req.GetInt("maxBytes", 0)
 	follow := req.GetBool("followRedirects", true)
 
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
 	defer cancel()
 
-	client := &http.Client{}
+	client := &http.Client{Transport: transport}
 	if !follow {
-		client.CheckRedirect = func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }
+		client.CheckRedirect = func(r *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }
+	} else {
+		// Only http(s) redirects are acceptable; IP validation happens at dial time.
+		client.CheckRedirect = func(r *http.Request, via []*http.Request) error {
+			if r.URL.Scheme != "http" && r.URL.Scheme != "https" {
+				return fmt.Errorf("redirect to non-http(s) scheme blocked: %s", r.URL.Scheme)
+			}
+			return nil
+		}
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, method, u.String(), strings.NewReader(body))
 	if err != nil {
 		return mcp.NewToolResultErrorf("request build failed: %v", err), nil
 	}
+	httpReq.Header.Set("User-Agent", "mcp-fileserver/"+serverVersion)
 	for k, v := range headers {
 		httpReq.Header.Set(k, v)
 	}
@@ -479,76 +768,68 @@ func handleHTTPRequest(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallT
 	return mcp.NewToolResultStructured(res, msg), nil
 }
 
-// Determine whether a host resolves only to private/loopback/link-local/etc IPs.
-func hostIsPrivate(host string) (bool, error) {
-	ips, err := net.LookupIP(host)
-	if err != nil {
-		return false, err
-	}
-	if len(ips) == 0 {
-		return false, fmt.Errorf("no A/AAAA records")
-	}
-	allPrivate := true
-	for _, ip := range ips {
-		if !isPrivateIP(ip) {
-			allPrivate = false
-			break
-		}
-	}
-	return allPrivate, nil
-}
-
-func isPrivateIP(ip net.IP) bool {
-	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
-		return true
-	}
-	// RFC1918 / Unique local
-	if ip.To4() != nil {
-		v4 := ip.To4()
-		switch {
-		case v4[0] == 10: // 10.0.0.0/8
-			return true
-		case v4[0] == 172 && v4[1] >= 16 && v4[1] <= 31: // 172.16.0.0/12
-			return true
-		case v4[0] == 192 && v4[1] == 168: // 192.168.0.0/16
-			return true
-		}
-		return false
-	}
-	// IPv6 unique local fc00::/7
-	return len(ip) == net.IPv6len && (ip[0]&0xFE) == 0xFC
-}
-
 // ---------- helpers ----------
 
-// resolveInsideBase returns (absPath, relClean) ensuring the target is within base.
-func resolveInsideBase(base, rel string) (string, string, error) {
-	cleanRel := filepath.Clean(strings.TrimPrefix(rel, string(filepath.Separator)))
-	abs := filepath.Join(base, cleanRel)
-	abs = filepath.Clean(abs)
-	// Ensure base is a prefix of abs (on the same volume)
-	baseWithSep := ensureTrailingSep(base)
-	if !strings.HasPrefix(ensureTrailingSep(abs), baseWithSep) {
-		return "", "", fmt.Errorf("path escapes base directory")
+func (a *app) checkSize(n int) error {
+	if a.cfg.MaxFileBytes > 0 && int64(n) > a.cfg.MaxFileBytes {
+		return fmt.Errorf("content too large: %d bytes (limit %d)", n, a.cfg.MaxFileBytes)
 	}
-	return abs, cleanRel, nil
+	return nil
 }
 
-func ensureTrailingSep(p string) string {
-	p = filepath.Clean(p)
-	if !strings.HasSuffix(p, string(filepath.Separator)) {
-		p += string(filepath.Separator)
+// isPrivateIP reports whether ip is a loopback, link-local, multicast,
+// unspecified, broadcast, RFC1918, unique-local, CGNAT, or IPv4-mapped
+// private address.
+func isPrivateIP(ip net.IP) bool {
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsMulticast() || ip.IsUnspecified() || ip.IsPrivate() {
+		return true
 	}
-	return p
+	if v4 := ip.To4(); v4 != nil {
+		// 255.255.255.255 broadcast
+		if v4[0] == 255 && v4[1] == 255 && v4[2] == 255 && v4[3] == 255 {
+			return true
+		}
+		// 100.64.0.0/10 CGNAT shared address space (e.g. Tailscale)
+		return v4[0] == 100 && v4[1]&0xC0 == 64
+	}
+	return false
+}
+
+// cleanRelPath normalizes a user-supplied relative path for use with os.Root.
+// Leading separators are tolerated (treated as relative), but traversal
+// outside the base is rejected up front for a clear error message
+// (os.Root would reject it anyway).
+func cleanRelPath(rel string) (string, error) {
+	rel = strings.TrimSpace(rel)
+	if rel == "" {
+		return ".", nil
+	}
+	if strings.ContainsRune(rel, 0) {
+		return "", errors.New("path contains NUL byte")
+	}
+	p := filepath.ToSlash(filepath.Clean(strings.TrimLeft(rel, "/")))
+	if p == "." {
+		return ".", nil
+	}
+	if p == ".." || strings.HasPrefix(p, "../") {
+		return "", errors.New("path escapes base directory")
+	}
+	return p, nil
 }
 
 func parseFlags() Config {
 	var cfg Config
+	var showVersion bool
 	flag.StringVar(&cfg.BaseDir, "base", ".", "Base directory the server will expose")
 	flag.BoolVar(&cfg.AllowOverwrite, "allow-overwrite", false, "Permit fs_create to overwrite existing files when overwrite=true")
-	// Default now unlimited (0)
 	flag.Int64Var(&cfg.MaxFileBytes, "max-bytes", 0, "Max bytes accepted for create/update (0 = unlimited)")
+	flag.BoolVar(&showVersion, "version", false, "Print version and exit")
 	flag.Parse()
+	if showVersion {
+		fmt.Printf("mcp-fileserver %s\n", serverVersion)
+		os.Exit(0)
+	}
 	return cfg
 }
 
@@ -557,10 +838,4 @@ func checkFatal(err error) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
-}
-
-// Utility to pretty-print JSON for debug (unused but handy during development)
-func toJSON(v any) string {
-	b, _ := json.MarshalIndent(v, "", "  ")
-	return string(b)
 }
