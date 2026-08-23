@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"path/filepath"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -51,13 +50,4 @@ func (a *app) renameNoReplace(fromRel, toRel string) error {
 	default:
 		return fmt.Errorf("renameat2: %w", err)
 	}
-}
-
-func pathSplitLast(rel string) (parent, base string) {
-	parent, base = filepath.Split(rel)
-	parent = filepath.ToSlash(filepath.Clean(parent))
-	if parent == "/" {
-		parent = "."
-	}
-	return parent, base
 }
