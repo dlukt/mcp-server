@@ -2,7 +2,10 @@ module github.com/dlukt/mcp-server
 
 go 1.26.7
 
-require github.com/mark3labs/mcp-go v0.58.0
+require (
+	github.com/mark3labs/mcp-go v0.58.0
+	golang.org/x/sys v0.47.0
+)
 
 require (
 	github.com/google/jsonschema-go v0.4.2 // indirect

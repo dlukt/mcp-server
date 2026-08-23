@@ -611,7 +611,10 @@ func handleRename(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolRe
 			return mcp.NewToolResultErrorf("mkdirs failed: %v", err), nil
 		}
 	}
-	if err := a.root.Rename(fromRel, toRel); err != nil {
+	if err := a.renameNoReplace(fromRel, toRel); err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			return mcp.NewToolResultError("destination exists; delete it first"), nil
+		}
 		return mcp.NewToolResultErrorf("rename failed: %v", err), nil
 	}
 	return mcp.NewToolResultStructured(
@@ -806,10 +809,10 @@ func isPrivateIP(ip net.IP) bool {
 }
 
 // cleanRelPath normalizes a user-supplied relative path for use with os.Root.
-// Leading separators are tolerated (treated as relative), but traversal
-// outside the base is rejected up front for a clear error message
-// (os.Root would reject it anyway). Whitespace is significant and preserved:
-// trimming would silently redirect "x.txt" requests to a different file.
+// Absolute paths and traversal outside the base are rejected up front for a
+// clear error message (os.Root would reject them anyway). Whitespace is
+// significant and preserved: trimming would silently redirect "x.txt"
+// requests to a different file.
 func cleanRelPath(rel string) (string, error) {
 	if rel == "" {
 		return ".", nil
@@ -817,7 +820,13 @@ func cleanRelPath(rel string) (string, error) {
 	if strings.ContainsRune(rel, 0) {
 		return "", errors.New("path contains NUL byte")
 	}
-	p := filepath.ToSlash(filepath.Clean(strings.TrimLeft(rel, "/")))
+	if os.IsPathSeparator(rel[0]) {
+		return "", errors.New("absolute paths are not allowed; use a path relative to the base directory")
+	}
+	if rel[0] == '~' && (len(rel) == 1 || os.IsPathSeparator(rel[1])) {
+		return "", errors.New("home-relative paths are not allowed; use a path relative to the base directory")
+	}
+	p := filepath.ToSlash(filepath.Clean(rel))
 	if p == "." {
 		return ".", nil
 	}

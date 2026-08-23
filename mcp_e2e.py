@@ -41,7 +41,10 @@ def get_json(resp):
     sc = resp["result"].get("structuredContent")
     if sc is not None:
         return sc
-    return json.loads(get_text(resp))
+    t = get_text(resp)
+    if t is None or not t.lstrip().startswith(("{", "[")):
+        raise AssertionError("no structured payload: " + repr(t))
+    return json.loads(t)
 
 def check(name, cond, detail=""):
     if cond:
@@ -213,6 +216,34 @@ r = call(proc, "fs_read", {"path": " padded.txt"})
 check("' padded.txt' survives delete of 'padded.txt'", get_json(r)["preview"] == "P", get_text(r))
 r = call(proc, "fs_delete", {"path": " padded.txt"})
 check("delete ' padded.txt' works", not is_err(r), get_text(r))
+
+# codex R2 P1: absolute paths must be rejected outright, not silently rebased
+r = call(proc, "fs_read", {"path": "/etc/passwd"})
+check("absolute path /etc/passwd rejected", is_err(r) and "absolute" in (get_text(r) or "").lower(), get_text(r))
+r = call(proc, "fs_create", {"path": "/abs.txt", "content": "A"})
+check("absolute create /abs.txt rejected", is_err(r), get_text(r))
+r = call(proc, "fs_list", {})
+check("no abs.txt leaked into sandbox root", "abs.txt" not in get_json(r)["paths"], get_text(r))
+import os as _os
+check("no /abs.txt on host", not _os.path.exists("/abs.txt"))
+r = call(proc, "fs_read", {"path": "~/x"})
+check("~/x rejected as home-relative", is_err(r), get_text(r))
+
+# codex R2 P2: rename must not clobber a concurrently created destination.
+# Use the pre-check path (destination exists) to verify fs.ErrExist mapping;
+# the atomicity itself is renameat2(RENAME_NOREPLACE) on Linux.
+r = call(proc, "fs_create", {"path": "victim.txt", "content": "VICTIM"})
+check("create victim.txt", not is_err(r), get_text(r))
+r = call(proc, "fs_create", {"path": "src.txt", "content": "SRC"})
+check("create src.txt", not is_err(r), get_text(r))
+r = call(proc, "fs_rename", {"from": "src.txt", "to": "victim.txt"})
+check("rename onto existing dest fails", is_err(r) and "exists" in (get_text(r) or "").lower(), get_text(r))
+r = call(proc, "fs_read", {"path": "victim.txt"})
+check("existing dest content intact after refused rename", get_json(r)["preview"] == "VICTIM", get_text(r))
+r = call(proc, "fs_rename", {"from": "src.txt", "to": "sub2/moved.txt", "makedirs": True})
+check("rename with makedirs works", not is_err(r), get_text(r))
+r = call(proc, "fs_read", {"path": "sub2/moved.txt"})
+check("moved file readable", get_json(r)["preview"] == "SRC", get_text(r))
 
 # codex P1: per-request transports must not accumulate idle keepalive sockets
 def mcp_socket_fds(pid):
