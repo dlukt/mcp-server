@@ -710,14 +710,23 @@ func handleHTTPRequest(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallT
 	if !follow {
 		client.CheckRedirect = func(r *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }
 	} else {
-		// Only http(s) redirects are acceptable; IP validation happens at dial time.
+		// Extend (not replace) the default policy: http(s) only, and keep the
+		// stdlib's ten-hop limit so cyclic redirect chains can't run until
+		// the overall timeout. IP validation happens at dial time.
 		client.CheckRedirect = func(r *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("stopped after 10 redirects")
+			}
 			if r.URL.Scheme != "http" && r.URL.Scheme != "https" {
 				return fmt.Errorf("redirect to non-http(s) scheme blocked: %s", r.URL.Scheme)
 			}
 			return nil
 		}
 	}
+	// The transport is per-request (its dial guard captures allowPrivate);
+	// it is never reused, so release its idle connections when done instead
+	// of accumulating sockets (and their read goroutines) across calls.
+	defer transport.CloseIdleConnections()
 
 	httpReq, err := http.NewRequestWithContext(ctx, method, u.String(), strings.NewReader(body))
 	if err != nil {
@@ -799,9 +808,9 @@ func isPrivateIP(ip net.IP) bool {
 // cleanRelPath normalizes a user-supplied relative path for use with os.Root.
 // Leading separators are tolerated (treated as relative), but traversal
 // outside the base is rejected up front for a clear error message
-// (os.Root would reject it anyway).
+// (os.Root would reject it anyway). Whitespace is significant and preserved:
+// trimming would silently redirect "x.txt" requests to a different file.
 func cleanRelPath(rel string) (string, error) {
-	rel = strings.TrimSpace(rel)
 	if rel == "" {
 		return ".", nil
 	}

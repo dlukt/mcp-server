@@ -150,10 +150,20 @@ check("listing through dir-symlink blocked", is_err(r), get_text(r))
 print("== http_request ==")
 # local server = private IP, must be blocked without allowPrivate
 class H(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
     def do_GET(self):
+        if self.path == "/loop":
+            body = b"looping"
+            self.send_response(302)
+            self.send_header("Location", "/loop")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if self.path == "/redirect":
             self.send_response(302)
             self.send_header("Location", "/flag")
+            self.send_header("Content-Length", "0")
             self.end_headers()
         else:
             body = b"LOCAL-SERVER-BODY"
@@ -184,6 +194,44 @@ check("non-http scheme blocked", is_err(r), get_text(r))
 r = call(proc, "http_request", {"method": "GET", "url": f"http://127.0.0.1:{port}/flag", "allowPrivate": True, "maxBytes": 5})
 j = get_json(r)
 check("maxBytes truncation", j["truncated"] is True and j["bytes"] == 5, get_text(r))
+
+# codex P2: redirect loop must stop at 10 hops
+r = call(proc, "http_request", {"method": "GET", "url": f"http://127.0.0.1:{port}/loop", "allowPrivate": True})
+txt = get_text(r) or ""
+check("redirect loop stops (10-hop cap)", is_err(r) and "10 redirects" in txt, txt[:120])
+
+# codex P1: whitespace-prefixed filename must not be redirected to the trimmed name
+r = call(proc, "fs_create", {"path": " padded.txt", "content": "P"})
+check("create ' padded.txt' (leading space)", not is_err(r), get_text(r))
+r = call(proc, "fs_create", {"path": "padded.txt", "content": "T"})
+check("create 'padded.txt' (no space)", not is_err(r), get_text(r))
+r = call(proc, "fs_read", {"path": " padded.txt"})
+check("' padded.txt' has its own content", get_json(r)["preview"] == "P", get_text(r))
+r = call(proc, "fs_delete", {"path": "padded.txt"})
+check("delete 'padded.txt' only", not is_err(r), get_text(r))
+r = call(proc, "fs_read", {"path": " padded.txt"})
+check("' padded.txt' survives delete of 'padded.txt'", get_json(r)["preview"] == "P", get_text(r))
+r = call(proc, "fs_delete", {"path": " padded.txt"})
+check("delete ' padded.txt' works", not is_err(r), get_text(r))
+
+# codex P1: per-request transports must not accumulate idle keepalive sockets
+def mcp_socket_fds(pid):
+    import glob as _g
+    n = 0
+    for fd in _g.glob(f"/proc/{pid}/fd/*"):
+        try:
+            if os.path.islink(fd) and os.readlink(fd).startswith("socket:"):
+                n += 1
+        except OSError:
+            pass
+    return n
+
+before = mcp_socket_fds(proc.pid)
+for _ in range(6):
+    r = call(proc, "http_request", {"method": "GET", "url": f"http://127.0.0.1:{port}/flag", "allowPrivate": True})
+    assert not is_err(r), get_text(r)
+after = mcp_socket_fds(proc.pid)
+check("no idle-socket accumulation (CloseIdleConnections)", after <= before + 1, f"sockets before={before} after={after}")
 
 # proxy env must be ignored
 os.environ["HTTP_PROXY"] = f"http://127.0.0.1:{port}"
